@@ -85,10 +85,15 @@ async function resolveWithCobaltChain(
 const YTDLP_BIN = process.env.YTDLP_BIN ?? "yt-dlp";
 const MAX_CONCURRENT = 2;
 
-/** Scrub sprite geometry — must match what the iOS player expects. */
-const SPRITE_INTERVAL_SECONDS = 5;
-const SPRITE_COLS = 5;
-const SPRITE_ROWS = 4;
+/**
+ * Scrub sprite geometry. One frame per second, up to 100 frames
+ * (10 columns, rows as needed), so the preview follows the finger in
+ * real time. The old 5s interval gave a 10s video only 2 frames — the
+ * popup barely changed while scrubbing. Longer videos stretch the
+ * interval so the sprite never exceeds 100 frames.
+ */
+const SPRITE_MAX_FRAMES = 100;
+const SPRITE_COLS = 10;
 
 const r2 =
   process.env.R2_ACCOUNT_ID &&
@@ -281,13 +286,22 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
     const r2Key = `users/me/items/${itemId}/original.${ext}`;
     const thumbKey = hasThumb ? `users/me/items/${itemId}/thumb.jpg` : null;
     const spritePath = join(dir, "sprite.jpg");
+    const spriteInterval =
+      meta.duration && meta.duration > 0
+        ? Math.max(1, meta.duration / SPRITE_MAX_FRAMES)
+        : 1;
+    const spriteCount =
+      meta.duration && meta.duration > 0
+        ? Math.min(Math.ceil(meta.duration / spriteInterval), SPRITE_MAX_FRAMES)
+        : SPRITE_MAX_FRAMES;
+    const spriteRows = Math.ceil(spriteCount / SPRITE_COLS);
     const sprite = await makeSprite(
       mediaPath,
       spritePath,
       meta.duration ?? null,
-      SPRITE_INTERVAL_SECONDS,
+      spriteInterval,
       SPRITE_COLS,
-      SPRITE_ROWS,
+      spriteRows,
     );
     const previewKey = sprite.ok ? `users/me/items/${itemId}/sprite.jpg` : null;
 
@@ -318,8 +332,8 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
       file_size: fileSize,
       sha256,
       preview_cols: sprite.ok ? SPRITE_COLS : null,
-      preview_rows: sprite.ok ? SPRITE_ROWS : null,
-      preview_interval: sprite.ok ? SPRITE_INTERVAL_SECONDS : null,
+      preview_rows: sprite.ok ? spriteRows : null,
+      preview_interval: sprite.ok ? spriteInterval : null,
       preview_count: sprite.ok ? sprite.count : null,
     });
   } catch (e) {

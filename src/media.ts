@@ -129,8 +129,11 @@ export interface SpriteResult {
  * 160px wide, tiled into a `cols` x `rows` grid in a single JPEG.
  * The iOS player crops one cell per scrub timestamp (frame index =
  * floor(seconds / interval), col = index % cols, row = floor(index / cols)).
- * Failure is non-fatal — the player just shows no preview for that item.
- * When duration is unknown the frame count is unknowable, so `count` falls
+ * The interval is 1s for videos up to 100s (so a 10s video gets 10 frames
+ * and the preview follows the finger in real time); longer videos stretch
+ * the interval so the sprite never exceeds 100 frames. Failure is
+ * non-fatal — the player just shows no preview for that item. When
+ * duration is unknown the frame count is unknowable, so `count` falls
  * back to cols*rows (the player clamps to the last cell; trailing cells
  * may be blank for short videos — probe almost always returns a duration).
  */
@@ -138,14 +141,17 @@ export function makeSprite(
   filePath: string,
   spritePath: string,
   duration: number | null,
-  intervalSeconds = 5,
-  cols = 5,
-  rows = 4,
+  intervalSeconds = 1,
+  cols = 10,
+  rows = 1,
 ): Promise<SpriteResult> {
   const count =
     duration && duration > 0
       ? Math.min(Math.ceil(duration / intervalSeconds), cols * rows)
       : cols * rows;
+  // fps as a plain decimal (e.g. 0.5556 for a 1.8s interval) — the fps
+  // filter's "1/1.8" rational form is not reliably parsed.
+  const fps = (1 / intervalSeconds).toFixed(4);
   return new Promise((resolve) => {
     const p = spawn("ffmpeg", [
       "-y",
@@ -154,7 +160,7 @@ export function makeSprite(
       "-i",
       filePath,
       "-vf",
-      `fps=1/${intervalSeconds},scale=160:-1,tile=${cols}x${rows}`,
+      `fps=${fps},scale=160:-1,tile=${cols}x${rows}`,
       "-frames:v",
       "1",
       "-q:v",
