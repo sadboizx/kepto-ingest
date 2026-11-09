@@ -29,7 +29,7 @@ import { createReadStream } from "node:fs";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveWithCobalt } from "./cobalt.js";
+import { resolveWithCobalt, type CobaltResult } from "./cobalt.js";
 import { downloadToFile, extFor, makeSprite, makeThumbnail, probe } from "./media.js";
 import { createR2Client, uploadFile } from "./r2.js";
 import { downloadWithYtdlp, dumpJsonMetadata, ytdlpAvailable, ytdlpVersion } from "./ytdlp.js";
@@ -40,6 +40,48 @@ const KEPTO_WORKER_URL = (process.env.KEPTO_WORKER_URL ?? "").replace(/\/$/, "")
 const R2_BUCKET = process.env.R2_BUCKET ?? "kepto-media";
 const COBALT_URL = process.env.COBALT_URL ?? "https://cobalt.up.railway.app/";
 const COBALT_API_KEY = process.env.COBALT_API_KEY ?? "";
+// Second Cobalt instance, tried only when the own instance fails (e.g.
+// TikTok serving the own instance's IP a challenge page). The public
+// pybalt proxy routes to many instances on different IPs and needs no
+// API key; leave empty to disable the fallback.
+const COBALT_FALLBACK_URL =
+  process.env.COBALT_FALLBACK_URL ?? "https://dwnld.nichind.dev/";
+
+/**
+ * Resolve a link with Cobalt, trying the own instance first and the
+ * public fallback proxy second. Different instances run on different
+ * IPs, so a TikTok challenge/block on one IP does not doom the job.
+ * Logs each failure with its instance label; throws the last error.
+ */
+async function resolveWithCobaltChain(
+  pageUrl: string,
+  itemId: string,
+): Promise<CobaltResult> {
+  const instances: { url: string; key: string; label: string }[] = [
+    { url: COBALT_URL, key: COBALT_API_KEY, label: "own" },
+  ];
+  if (COBALT_FALLBACK_URL) {
+    instances.push({ url: COBALT_FALLBACK_URL, key: "", label: "fallback" });
+  }
+  let lastError: unknown = new Error("cobalt_no_instance");
+  for (const inst of instances) {
+    try {
+      const result = await resolveWithCobalt(pageUrl, inst.url, inst.key);
+      if (inst.label !== "own") {
+        console.log(
+          JSON.stringify({ event: "cobalt_fallback_used", item_id: itemId, instance: inst.label }),
+        );
+      }
+      return result;
+    } catch (e) {
+      lastError = e;
+      console.log(
+        JSON.stringify({ event: "cobalt_failed", item_id: itemId, instance: inst.label, error: String(e) }),
+      );
+    }
+  }
+  throw lastError;
+}
 const YTDLP_BIN = process.env.YTDLP_BIN ?? "yt-dlp";
 const MAX_CONCURRENT = 2;
 
@@ -201,7 +243,7 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
     let sha256: string;
     let cobaltFilename: string | undefined;
     try {
-      const resolved = await resolveWithCobalt(pageUrl, COBALT_URL, COBALT_API_KEY);
+      const resolved = await resolveWithCobaltChain(pageUrl, itemId);
       cobaltFilename = resolved.filename;
       const ext = extFor(null, resolved.filename);
       const dl = await downloadToFile(resolved.url, join(dir, `media.${ext}`));
@@ -210,9 +252,7 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
       fileSize = dl.fileSize;
       sha256 = dl.sha256;
     } catch (cobaltErr) {
-      console.log(
-        JSON.stringify({ event: "cobalt_failed", item_id: itemId, error: String(cobaltErr) }),
-      );
+      // The chain already logged each cobalt_failed (per instance).
       if (!(await ytdlpAvailable(YTDLP_BIN))) {
         throw new Error(`cobalt_failed_no_ytdlp: ${String(cobaltErr)}`);
       }
