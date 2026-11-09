@@ -20,7 +20,11 @@ export interface TikwmResult {
 }
 
 export async function resolveWithTikwm(pageUrl: string): Promise<TikwmResult> {
-  const api = `https://www.tikwm.com/api/?url=${encodeURIComponent(pageUrl)}`;
+  // hd=1 asks TikWM for the HD variant: the response then includes
+  // `hdplay` (and `hd_size`) — the highest-quality mp4 available.
+  // Prefer it; fall back to the regular `play` URL when a video has
+  // no separate HD version (hdplay missing or empty).
+  const api = `https://www.tikwm.com/api/?url=${encodeURIComponent(pageUrl)}&hd=1`;
   const res = await fetch(api, {
     headers: { "User-Agent": "kepto-ingest/0.1" },
     signal: AbortSignal.timeout(30_000),
@@ -32,12 +36,15 @@ export async function resolveWithTikwm(pageUrl: string): Promise<TikwmResult> {
     data?: Record<string, unknown>;
   };
   const data = j.data;
-  if (j.code !== 0 || !data || typeof data.play !== "string" || !data.play) {
+  const hdplay = typeof data?.hdplay === "string" ? data.hdplay : "";
+  const play = typeof data?.play === "string" ? data.play : "";
+  const playUrl = hdplay || play;
+  if (j.code !== 0 || !data || !playUrl) {
     throw new Error(`tikwm_${typeof j.msg === "string" ? j.msg : "failed"}`);
   }
   const author = data.author as Record<string, unknown> | undefined;
   return {
-    playUrl: data.play,
+    playUrl,
     musicUrl: typeof data.music === "string" ? data.music : undefined,
     title: typeof data.title === "string" ? data.title : undefined,
     author:
