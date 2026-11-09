@@ -116,6 +116,22 @@ app.use(express.json({ limit: "16kb" }));
 
 let active = 0;
 const activeIds = new Set<string>();
+// Jobs waiting for a free slot. The Worker fires all of a collection's
+// ingest calls at once (fire-and-forget); with MAX_CONCURRENT = 2 the
+// 3rd+ job used to be rejected with "ingest_busy_try_again" and the
+// item marked failed. Now it queues instead — a job is only started
+// when a slot frees up, so no job is ever lost to capacity.
+const queue: Array<{ itemId: string; pageUrl: string }> = [];
+
+function pumpQueue(): void {
+  while (active < MAX_CONCURRENT && queue.length > 0) {
+    const job = queue.shift()!;
+    void runJob(job.itemId, job.pageUrl).finally(() => {
+      activeIds.delete(job.itemId);
+      pumpQueue();
+    });
+  }
+}
 
 function authed(req: express.Request): boolean {
   if (!INGEST_TOKEN) return false;
@@ -127,6 +143,7 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "kepto-ingest",
     active,
+    queued: queue.length,
     cobalt_configured: Boolean(COBALT_URL),
     r2_configured: Boolean(r2),
   });
@@ -152,8 +169,19 @@ app.post("/ingest", (req, res) => {
     return res.json({ ok: true, item_id, status: "already_running" });
   }
   activeIds.add(item_id);
-  void runJob(item_id, url).finally(() => activeIds.delete(item_id));
-  return res.status(202).json({ ok: true, item_id, status: "accepted" });
+  if (active < MAX_CONCURRENT) {
+    void runJob(item_id, url).finally(() => {
+      activeIds.delete(item_id);
+      pumpQueue();
+    });
+    return res.status(202).json({ ok: true, item_id, status: "accepted" });
+  }
+  // At capacity: queue it instead of rejecting. The job starts when a
+  // slot frees up; the Worker still gets 202, so the item stays pending
+  // (not failed) until the job runs and reports back.
+  queue.push({ itemId: item_id, pageUrl: url });
+  console.log(JSON.stringify({ event: "ingest_queued", item_id, queue_length: queue.length }));
+  return res.status(202).json({ ok: true, item_id, status: "queued" });
 });
 
 /**
@@ -265,12 +293,11 @@ async function gatherMetadata(pageUrl: string): Promise<GatheredMeta> {
 }
 
 async function runJob(itemId: string, pageUrl: string): Promise<void> {
+  // runJob is only started by pumpQueue / the /ingest handler when
+  // active < MAX_CONCURRENT, so no busy check is needed here.
   active++;
   const dir = await mkdtemp(join(tmpdir(), "kepto-"));
   try {
-    if (active > MAX_CONCURRENT) {
-      throw new Error("ingest_busy_try_again");
-    }
     if (!r2) throw new Error("r2_not_configured");
     console.log(JSON.stringify({ event: "ingest_start", item_id: itemId, url: pageUrl }));
 
@@ -315,6 +342,14 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
 
     // 2. Probe + thumbnail + scrub sprite (thumbnail/sprite failure is non-fatal).
     const meta = await probe(mediaPath);
+    // Audio-only posts (a TikTok sound/music post has an audio stream
+    // but no video stream): there is no frame to thumbnail or sprite,
+    // and a video grid cannot display it. Fail with a clear reason
+    // instead of saving a black cell. Detected via hasAudio + no
+    // video width (a probe failure returns {} so it never triggers).
+    if (meta.hasAudio && !meta.width) {
+      throw new Error("audio_only_no_video");
+    }
     const gathered = await metaPromise;
     const ext = extFor(contentType, cobaltFilename) || mediaPath.split(".").pop() || "mp4";
     const thumbPath = join(dir, "thumb.jpg");
