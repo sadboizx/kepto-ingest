@@ -125,6 +125,64 @@ export interface SpriteResult {
 }
 
 /**
+ * Slideshow video for a TikTok photo post: yt-dlp finds no video stream
+ * for these (only the background-music audio + the photos), so a video
+ * grid cannot display them. Build an mp4 that shows each photo for an
+ * equal share of `totalSeconds` (letterboxed to 1080x1920, TikTok
+ * portrait) with the audio track as soundtrack when present (silent
+ * when not). Uses the concat demuxer + one scale/pad filter, so mixed
+ * photo sizes are fine. Returns true when the mp4 was created.
+ */
+export async function makeSlideshow(
+  imagePaths: string[],
+  audioPath: string | null,
+  totalSeconds: number,
+  outPath: string,
+): Promise<boolean> {
+  if (!imagePaths.length || !(totalSeconds > 0)) return false;
+  const per = totalSeconds / imagePaths.length;
+  const listPath = `${outPath}.list.txt`;
+  // The concat demuxer needs the last file repeated (without a duration)
+  // or the final segment is dropped.
+  const lines = imagePaths.flatMap((p) => [
+    `file '${p.replace(/'/g, "'\\''")}'`,
+    `duration ${per.toFixed(3)}`,
+  ]);
+  lines.push(`file '${imagePaths[imagePaths.length - 1].replace(/'/g, "'\\''")}'`);
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(listPath, lines.join("\n") + "\n");
+  const args = [
+    "-y",
+    "-v",
+    "error",
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    listPath,
+  ];
+  if (audioPath) args.push("-i", audioPath);
+  args.push(
+    "-vf",
+    "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+  );
+  if (audioPath) args.push("-c:a", "aac", "-shortest");
+  args.push("-movflags", "+faststart", outPath);
+  return new Promise((resolve) => {
+    const p = spawn("ffmpeg", args);
+    p.on("error", () => resolve(false));
+    p.on("close", (code) => resolve(code === 0));
+  });
+}
+
+/**
  * Scrub-preview sprite: one frame every `intervalSeconds`, scaled to
  * 160px wide, tiled into a `cols` x `rows` grid in a single JPEG.
  * The iOS player crops one cell per scrub timestamp (frame index =

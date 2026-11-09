@@ -30,7 +30,7 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveWithCobalt, type CobaltResult } from "./cobalt.js";
-import { downloadToFile, extFor, makeSprite, makeThumbnail, probe } from "./media.js";
+import { downloadToFile, extFor, makeSlideshow, makeSprite, makeThumbnail, probe } from "./media.js";
 import { createR2Client, uploadFile } from "./r2.js";
 import { downloadWithYtdlp, dumpJsonMetadata, expandPlaylist, ytdlpAvailable, ytdlpVersion } from "./ytdlp.js";
 
@@ -241,6 +241,8 @@ interface GatheredMeta {
   caption?: string;
   postedAt?: string | null;
   viewCount?: number | null;
+  duration?: number | null;
+  images?: string[];
 }
 
 /**
@@ -289,6 +291,8 @@ async function gatherMetadata(pageUrl: string): Promise<GatheredMeta> {
     caption: yt.description?.slice(0, 500),
     postedAt,
     viewCount: yt.viewCount ?? null,
+    duration: yt.duration ?? null,
+    images: yt.images,
   };
 }
 
@@ -341,14 +345,71 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
     }
 
     // 2. Probe + thumbnail + scrub sprite (thumbnail/sprite failure is non-fatal).
-    const meta = await probe(mediaPath);
-    // Audio-only posts (a TikTok sound/music post has an audio stream
-    // but no video stream): there is no frame to thumbnail or sprite,
-    // and a video grid cannot display it. Fail with a clear reason
-    // instead of saving a black cell. Detected via hasAudio + no
-    // video width (a probe failure returns {} so it never triggers).
-    if (meta.hasAudio && !meta.width) {
-      throw new Error("audio_only_no_video");
+    let meta = await probe(mediaPath);
+    // No video stream: either a TikTok sound post (audio only) or a
+    // photo post (images + optional background music — yt-dlp finds no
+    // video format for these, only the mp3 + the photos). A photo post
+    // is still visual content the user wants saved, so build a
+    // slideshow video from its photos (+ the audio as soundtrack) and
+    // save that instead. Only fail when there are no photos to build
+    // from (a true audio-only post). A probe failure returns {} so it
+    // never triggers this branch.
+    if (!meta.width) {
+      const gatheredEarly = await metaPromise;
+      const images = gatheredEarly.images ?? [];
+      let built = false;
+      if (images.length) {
+        const imgPaths: string[] = [];
+        for (let i = 0; i < images.length; i++) {
+          try {
+            const dl = await downloadToFile(images[i], join(dir, `photo${i}.jpg`));
+            imgPaths.push(dl.path);
+          } catch {
+            // One photo failing must not kill the slideshow.
+          }
+        }
+        if (imgPaths.length) {
+          const totalSeconds =
+            gatheredEarly.duration && gatheredEarly.duration > 0
+              ? gatheredEarly.duration
+              : meta.duration && meta.duration > 0
+                ? meta.duration
+                : imgPaths.length * 5;
+          const slideshowPath = join(dir, "slideshow.mp4");
+          built = await makeSlideshow(
+            imgPaths,
+            meta.hasAudio ? mediaPath : null,
+            totalSeconds,
+            slideshowPath,
+          );
+          if (built) {
+            mediaPath = slideshowPath;
+            contentType = "video/mp4";
+            const st = await stat(mediaPath);
+            fileSize = st.size;
+            sha256 = await new Promise<string>((resolve, reject) => {
+              const h = createHash("sha256");
+              const s = createReadStream(mediaPath);
+              s.on("data", (c: Buffer | string) => h.update(c));
+              s.on("end", () => resolve(h.digest("hex")));
+              s.on("error", reject);
+            });
+            meta = await probe(mediaPath);
+            console.log(
+              JSON.stringify({
+                event: "slideshow_built",
+                item_id: itemId,
+                photos: imgPaths.length,
+                seconds: totalSeconds,
+                has_audio: Boolean(meta.hasAudio),
+              }),
+            );
+          }
+        }
+      }
+      if (!built) {
+        throw new Error(meta.hasAudio ? "audio_only_no_video" : "no_video_stream");
+      }
     }
     const gathered = await metaPromise;
     const ext = extFor(contentType, cobaltFilename) || mediaPath.split(".").pop() || "mp4";

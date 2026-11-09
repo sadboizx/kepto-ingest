@@ -277,6 +277,14 @@ export interface YtDlpMetadata {
   uploadDate?: string;
   /** View count from the extractor (TikTok: view_count), when available. */
   viewCount?: number;
+  /** Post duration in seconds (TikTok photo posts: the slideshow length). */
+  duration?: number;
+  /**
+   * Photo URLs for a TikTok photo post (slideshow): one entry per photo,
+   * deduplicated by URL path (the same photo is listed once per CDN host).
+   * Empty/absent for a normal video post (its thumbnails are just covers).
+   */
+  images?: string[];
 }
 
 /**
@@ -328,6 +336,21 @@ export function dumpJsonMetadata(
           typeof j[k] === "string" ? (j[k] as string) : undefined;
         const pickNum = (k: string): number | undefined =>
           typeof j[k] === "number" ? (j[k] as number) : undefined;
+        // Photo-post images: yt-dlp lists one thumbnail per photo (the
+        // same photo repeats on several CDN hosts, so dedupe by the full
+        // URL path after the host — the image hash differs per photo).
+        const images: string[] = [];
+        const seenPaths = new Set<string>();
+        for (const t of Array.isArray(j.thumbnails) ? j.thumbnails : []) {
+          const rec = t as Record<string, unknown>;
+          const u = typeof rec.url === "string" ? rec.url : "";
+          if (!/^https?:\/\//i.test(u)) continue;
+          const afterHost = u.split("://", 2)[1] ?? u;
+          const path = afterHost.split("/").slice(1).join("/");
+          if (!path || seenPaths.has(path)) continue;
+          seenPaths.add(path);
+          images.push(u);
+        }
         finish({
           uploaderId: pick("uploader_id"),
           uploader: pick("uploader"),
@@ -335,6 +358,8 @@ export function dumpJsonMetadata(
           description: pick("description"),
           uploadDate: pick("upload_date"),
           viewCount: pickNum("view_count"),
+          duration: pickNum("duration"),
+          images: images.length ? images : undefined,
         });
       } catch {
         finish({});
