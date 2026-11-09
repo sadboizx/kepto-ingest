@@ -32,7 +32,7 @@ import { join } from "node:path";
 import { resolveWithCobalt, type CobaltResult } from "./cobalt.js";
 import { downloadToFile, extFor, makeSprite, makeThumbnail, probe } from "./media.js";
 import { createR2Client, uploadFile } from "./r2.js";
-import { downloadWithYtdlp, dumpJsonMetadata, ytdlpAvailable, ytdlpVersion } from "./ytdlp.js";
+import { downloadWithYtdlp, dumpJsonMetadata, expandPlaylist, ytdlpAvailable, ytdlpVersion } from "./ytdlp.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const INGEST_TOKEN = process.env.INGEST_TOKEN ?? "";
@@ -154,6 +154,42 @@ app.post("/ingest", (req, res) => {
   activeIds.add(item_id);
   void runJob(item_id, url).finally(() => activeIds.delete(item_id));
   return res.status(202).json({ ok: true, item_id, status: "accepted" });
+});
+
+/**
+ * Expand a collection/playlist URL into its video URLs (for "save all
+ * videos from a TikTok Collection"). Called by the Worker, which then
+ * saves each URL as its own item. Synchronous: yt-dlp --flat-playlist
+ * takes ~5-30s for a collection. Auth: Bearer INGEST_TOKEN (same as
+ * /ingest). Returns { ok, title, urls, count }.
+ */
+app.post("/expand-collection", async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ ok: false, error: "Unauthorized." });
+  const { url } = (req.body ?? {}) as { url?: unknown };
+  if (typeof url !== "string" || !/^https?:\/\//i.test(url)) {
+    return res.status(422).json({ ok: false, error: "url must be http(s)." });
+  }
+  try {
+    const expanded = await expandPlaylist(url, YTDLP_BIN);
+    console.log(
+      JSON.stringify({
+        event: "expand_collection",
+        url,
+        count: expanded.urls.length,
+        title: expanded.title ?? null,
+      }),
+    );
+    return res.json({
+      ok: true,
+      title: expanded.title ?? null,
+      urls: expanded.urls,
+      count: expanded.urls.length,
+    });
+  } catch (e) {
+    const message = String(e instanceof Error ? e.message : e).slice(0, 300);
+    console.log(JSON.stringify({ event: "expand_collection_failed", url, error: message }));
+    return res.status(422).json({ ok: false, error: message });
+  }
 });
 
 async function callback(body: Record<string, unknown>): Promise<void> {

@@ -65,6 +65,104 @@ export async function downloadWithYtdlp(
   return join(outDir, files[0]);
 }
 
+export interface ExpandedPlaylist {
+  title?: string;
+  urls: string[];
+}
+
+/**
+ * Expand a playlist/collection URL into its video URLs.
+ * `yt-dlp --flat-playlist -J` returns one JSON object: `_type:
+ * "playlist"` with `entries[]` (each with `webpage_url`), or a single
+ * video object when the URL is one video. Used for "save all videos
+ * from a TikTok Collection" — yt-dlp has a dedicated `tiktok:collection`
+ * extractor, and a user page works the same way. Rejects when the URL
+ * is not a playlist/collection, is private, or yt-dlp cannot read it
+ * (e.g. a challenge page). Capped at maxEntries.
+ */
+export function expandPlaylist(
+  pageUrl: string,
+  bin: string,
+  maxEntries = 100,
+  timeoutMs = 120_000,
+): Promise<ExpandedPlaylist> {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (fn: () => void) => {
+      if (done) return;
+      done = true;
+      fn();
+    };
+    const p = spawn(
+      bin,
+      [
+        "--flat-playlist",
+        "--no-warnings",
+        "--playlist-end",
+        String(maxEntries),
+        "-J",
+        pageUrl,
+      ],
+      { stdio: "pipe" },
+    );
+    let out = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      try {
+        p.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      finish(() => reject(new Error("expand_timeout")));
+    }, timeoutMs);
+    p.stdout?.on("data", (d: Buffer) => {
+      out += d.toString();
+    });
+    p.stderr?.on("data", (d: Buffer) => {
+      stderr += d.toString();
+    });
+    p.on("error", (e) => {
+      clearTimeout(timer);
+      finish(() => reject(new Error(`expand_spawn: ${e.message}`)));
+    });
+    p.on("close", (code) => {
+      clearTimeout(timer);
+      finish(() => {
+        if (code !== 0) {
+          reject(new Error(`expand_failed: ${stderr.slice(0, 300) || `exit ${code}`}`));
+          return;
+        }
+        try {
+          const j = JSON.parse(out) as Record<string, unknown>;
+          const urls: string[] = [];
+          const pushUrl = (u: unknown) => {
+            if (typeof u === "string" && /^https?:\/\//i.test(u) && !urls.includes(u)) {
+              urls.push(u);
+            }
+          };
+          const entries = Array.isArray(j.entries) ? j.entries : [];
+          for (const e of entries) {
+            const rec = e as Record<string, unknown>;
+            pushUrl(rec.webpage_url ?? rec.url);
+          }
+          // A single video URL (not a playlist) returns the video itself.
+          if (!urls.length) pushUrl(j.webpage_url);
+          if (!urls.length) {
+            reject(new Error("expand_empty: no videos found in this collection"));
+            return;
+          }
+          resolve({
+            title: typeof j.title === "string" ? j.title : undefined,
+            urls: urls.slice(0, maxEntries),
+          });
+        } catch {
+          reject(new Error("expand_bad_json"));
+        }
+      });
+    });
+  });
+}
+
 export interface YtDlpMetadata {
   uploaderId?: string;
   uploader?: string;
