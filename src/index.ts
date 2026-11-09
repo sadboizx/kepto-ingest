@@ -22,10 +22,14 @@
  *   INGEST_TOKEN, KEPTO_WORKER_URL, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
  *   R2_SECRET_ACCESS_KEY, R2_BUCKET, COBALT_URL, COBALT_API_KEY,
  *   YTDLP_BIN, PORT
+ *   TIKTOK_COOKIES — optional: the full Netscape cookies.txt content
+ *   of a throwaway TikTok account. When set, yt-dlp runs with
+ *   --cookies so it can list age-restricted / login-walled collections
+ *   and download age-restricted videos. Never log its content.
  */
 import express from "express";
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { chmodSync, createReadStream, writeFileSync } from "node:fs";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -85,6 +89,28 @@ async function resolveWithCobaltChain(
 }
 const YTDLP_BIN = process.env.YTDLP_BIN ?? "yt-dlp";
 const MAX_CONCURRENT = 2;
+
+// TikTok session cookies for a throwaway account (Netscape cookies.txt
+// content, pasted into the TIKTOK_COOKIES env var). Written to a 0600
+// file at startup and passed to yt-dlp as --cookies; Railway redeploys
+// on env-var change, so a refreshed cookie takes effect on the next
+// deploy. The content is a live session credential — it is never
+// logged, and only its presence is reported (health + startup log).
+// Without it, yt-dlp runs anonymously as before.
+let COOKIES_FILE: string | null = null;
+const cookiesContent = (process.env.TIKTOK_COOKIES ?? "").trim();
+if (cookiesContent) {
+  try {
+    const p = join(tmpdir(), "tiktok-cookies.txt");
+    writeFileSync(p, cookiesContent.endsWith("\n") ? cookiesContent : cookiesContent + "\n", {
+      mode: 0o600,
+    });
+    chmodSync(p, 0o600);
+    COOKIES_FILE = p;
+  } catch (e) {
+    console.log(JSON.stringify({ event: "cookies_write_failed", error: String(e).slice(0, 200) }));
+  }
+}
 
 /**
  * Scrub sprite geometry. One frame per second, up to 100 frames
@@ -147,6 +173,7 @@ app.get("/health", (_req, res) => {
     queued: queue.length,
     cobalt_configured: Boolean(COBALT_URL),
     r2_configured: Boolean(r2),
+    cookies_configured: Boolean(COOKIES_FILE),
   });
 });
 
@@ -199,7 +226,7 @@ app.post("/expand-collection", async (req, res) => {
     return res.status(422).json({ ok: false, error: "url must be http(s)." });
   }
   try {
-    const expanded = await expandPlaylist(url, YTDLP_BIN);
+    const expanded = await expandPlaylist(url, YTDLP_BIN, 100, 120_000, COOKIES_FILE);
     console.log(
       JSON.stringify({
         event: "expand_collection",
@@ -279,7 +306,7 @@ async function resolveUsernameFromUrl(pageUrl: string): Promise<string | null> {
 async function gatherMetadata(pageUrl: string): Promise<GatheredMeta> {
   const [username, yt] = await Promise.all([
     resolveUsernameFromUrl(pageUrl),
-    dumpJsonMetadata(pageUrl, YTDLP_BIN),
+    dumpJsonMetadata(pageUrl, YTDLP_BIN, 15_000, COOKIES_FILE),
   ]);
   let postedAt: string | null = null;
   if (yt.uploadDate && /^\d{8}$/.test(yt.uploadDate)) {
@@ -359,7 +386,7 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
           throw new Error(`cobalt_failed_no_ytdlp: ${cobaltMsg}`);
         }
         try {
-          mediaPath = await downloadWithYtdlp(pageUrl, dir, YTDLP_BIN);
+          mediaPath = await downloadWithYtdlp(pageUrl, dir, YTDLP_BIN, COOKIES_FILE);
           const st = await stat(mediaPath);
           fileSize = st.size;
           contentType = null;
@@ -529,6 +556,7 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
 
 app.listen(PORT, () => {
   console.log(`[kepto-ingest] listening on :${PORT}`);
+  console.log(JSON.stringify({ event: "cookies_configured", cookies: Boolean(COOKIES_FILE) }));
   void ytdlpVersion(YTDLP_BIN).then((version) => {
     console.log(JSON.stringify({ event: "ytdlp_version", version }));
   });

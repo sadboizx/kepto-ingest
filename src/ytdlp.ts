@@ -36,8 +36,13 @@ export async function downloadWithYtdlp(
   pageUrl: string,
   outDir: string,
   bin: string,
+  cookiesFile?: string | null,
 ): Promise<string> {
   const args = [
+    // Logged-in session (throwaway account) so yt-dlp can fetch
+    // age-restricted / login-walled posts. Omitted when no cookies
+    // are configured — anonymous download as before.
+    ...(cookiesFile ? ["--cookies", cookiesFile] : []),
     "--no-playlist",
     "--no-warnings",
     // Impersonate Chrome so TikTok serves the media instead of a
@@ -124,12 +129,13 @@ export async function expandPlaylist(
   bin: string,
   maxEntries = 100,
   timeoutMs = 120_000,
+  cookiesFile?: string | null,
 ): Promise<ExpandedPlaylist> {
   const resolved = await resolveFinalUrl(pageUrl);
   let lastError: Error = new Error("expand_failed: unknown");
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      return await expandOnce(resolved, bin, maxEntries, timeoutMs);
+      return await expandOnce(resolved, bin, maxEntries, timeoutMs, cookiesFile);
     } catch (e) {
       lastError = e instanceof Error ? e : new Error(String(e));
       if (attempt === 0) {
@@ -182,6 +188,7 @@ function expandOnce(
   bin: string,
   maxEntries: number,
   timeoutMs: number,
+  cookiesFile?: string | null,
 ): Promise<ExpandedPlaylist> {
   return new Promise((resolve, reject) => {
     let done = false;
@@ -193,6 +200,7 @@ function expandOnce(
     const p = spawn(
       bin,
       [
+        ...(cookiesFile ? ["--cookies", cookiesFile] : []),
         "--flat-playlist",
         "--no-warnings",
         // Impersonate Chrome (needs curl-cffi, installed in the
@@ -299,6 +307,7 @@ export function dumpJsonMetadata(
   pageUrl: string,
   bin: string,
   timeoutMs = 15_000,
+  cookiesFile?: string | null,
 ): Promise<YtDlpMetadata> {
   return new Promise((resolve) => {
     let done = false;
@@ -309,7 +318,16 @@ export function dumpJsonMetadata(
     };
     const p = spawn(
       bin,
-      ["--no-playlist", "--no-warnings", "--impersonate", "chrome", "--skip-download", "--dump-json", pageUrl],
+      [
+        ...(cookiesFile ? ["--cookies", cookiesFile] : []),
+        "--no-playlist",
+        "--no-warnings",
+        "--impersonate",
+        "chrome",
+        "--skip-download",
+        "--dump-json",
+        pageUrl,
+      ],
       { stdio: "pipe" },
     );
     let out = "";
