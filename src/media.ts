@@ -133,6 +133,71 @@ export interface SpriteResult {
  * when not). Uses the concat demuxer + one scale/pad filter, so mixed
  * photo sizes are fine. Returns true when the mp4 was created.
  */
+/**
+ * Normalize an image file to a real JPEG. TikTok serves photo-post
+ * images in mixed formats — JPEG, still WebP, and ANIMATED WebP
+ * (the cover/poster frame: VP8X + ANIM/ANMF chunks). ffmpeg's native
+ * WebP decoder cannot decode animated WebP ("image data not found"),
+ * so feeding the raw download to the concat demuxer fails the whole
+ * slideshow and the job dies with audio_only_no_video. Pillow (PIL)
+ * decodes every variant (animated WebP -> its first frame) and writes
+ * a JPEG. A JPEG input is copied through untouched (no re-encode).
+ * Returns true when outPath is a usable JPEG, false when the image
+ * cannot be converted (the caller skips that photo instead of failing).
+ */
+export async function normalizeImageToJpeg(
+  inputPath: string,
+  outputPath: string,
+): Promise<boolean> {
+  const { readFile, copyFile } = await import("node:fs/promises");
+  let head: Buffer;
+  try {
+    head = (await readFile(inputPath)).subarray(0, 12);
+  } catch {
+    return false;
+  }
+  // JPEG: FF D8 FF — copy through, no re-encode.
+  if (
+    head.length >= 3 &&
+    head[0] === 0xff &&
+    head[1] === 0xd8 &&
+    head[2] === 0xff
+  ) {
+    try {
+      await copyFile(inputPath, outputPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  // Anything else (WebP incl. animated, PNG, ...): Pillow converts.
+  const pyCode = [
+    "from PIL import Image",
+    "import sys",
+    "im = Image.open(sys.argv[1])",
+    "im.convert('RGB').save(sys.argv[2], 'JPEG', quality=90)",
+  ].join("; ");
+  const pilOk = await new Promise<boolean>((resolve) => {
+    const p = spawn("python3", ["-c", pyCode, inputPath, outputPath]);
+    p.on("error", () => resolve(false));
+    p.on("close", (code) => resolve(code === 0));
+  });
+  if (pilOk) return true;
+  // Pillow missing/failed: ffmpeg handles still WebP + PNG + JPEG.
+  return await new Promise<boolean>((resolve) => {
+    const p = spawn("ffmpeg", [
+      "-y",
+      "-v",
+      "error",
+      "-i",
+      inputPath,
+      outputPath,
+    ]);
+    p.on("error", () => resolve(false));
+    p.on("close", (code) => resolve(code === 0));
+  });
+}
+
 export async function makeSlideshow(
   imagePaths: string[],
   audioPath: string | null,
@@ -140,15 +205,36 @@ export async function makeSlideshow(
   outPath: string,
 ): Promise<boolean> {
   if (!imagePaths.length || !(totalSeconds > 0)) return false;
-  const per = totalSeconds / imagePaths.length;
+  // Normalize every photo to a real JPEG first. TikTok serves mixed
+  // formats (JPEG / still WebP / animated WebP cover) and ffmpeg's
+  // concat demuxer chokes on animated WebP, failing the whole build.
+  // A photo that cannot be converted is skipped, not fatal — the
+  // slideshow is built from the photos that did convert.
+  const normalized: string[] = [];
+  for (let i = 0; i < imagePaths.length; i++) {
+    const normPath = `${outPath}.norm-${i}.jpg`;
+    if (await normalizeImageToJpeg(imagePaths[i], normPath)) {
+      normalized.push(normPath);
+    } else {
+      console.log(
+        JSON.stringify({
+          event: "slideshow_photo_skipped",
+          index: i,
+          path: imagePaths[i],
+        }),
+      );
+    }
+  }
+  if (!normalized.length) return false;
+  const per = totalSeconds / normalized.length;
   const listPath = `${outPath}.list.txt`;
   // The concat demuxer needs the last file repeated (without a duration)
   // or the final segment is dropped.
-  const lines = imagePaths.flatMap((p) => [
+  const lines = normalized.flatMap((p) => [
     `file '${p.replace(/'/g, "'\\''")}'`,
     `duration ${per.toFixed(3)}`,
   ]);
-  lines.push(`file '${imagePaths[imagePaths.length - 1].replace(/'/g, "'\\''")}'`);
+  lines.push(`file '${normalized[normalized.length - 1].replace(/'/g, "'\\''")}'`);
   const { writeFile } = await import("node:fs/promises");
   await writeFile(listPath, lines.join("\n") + "\n");
   const args = [
