@@ -72,6 +72,8 @@ export interface YtDlpMetadata {
   description?: string;
   /** Original upload date as YYYYMMDD, when the extractor provides it. */
   uploadDate?: string;
+  /** View count from the extractor (TikTok: view_count), when available. */
+  viewCount?: number;
 }
 
 /**
@@ -121,12 +123,15 @@ export function dumpJsonMetadata(
         const j = JSON.parse(out) as Record<string, unknown>;
         const pick = (k: string): string | undefined =>
           typeof j[k] === "string" ? (j[k] as string) : undefined;
+        const pickNum = (k: string): number | undefined =>
+          typeof j[k] === "number" ? (j[k] as number) : undefined;
         finish({
           uploaderId: pick("uploader_id"),
           uploader: pick("uploader"),
           title: pick("title"),
           description: pick("description"),
           uploadDate: pick("upload_date"),
+          viewCount: pickNum("view_count"),
         });
       } catch {
         finish({});

@@ -171,6 +171,7 @@ interface GatheredMeta {
   title?: string;
   caption?: string;
   postedAt?: string | null;
+  viewCount?: number | null;
 }
 
 /**
@@ -218,6 +219,7 @@ async function gatherMetadata(pageUrl: string): Promise<GatheredMeta> {
     title: yt.title,
     caption: yt.description?.slice(0, 500),
     postedAt,
+    viewCount: yt.viewCount ?? null,
   };
 }
 
@@ -309,6 +311,7 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
       author: gathered.author ?? null,
       author_username: gathered.authorUsername ?? null,
       posted_at: gathered.postedAt ?? null,
+      view_count: gathered.viewCount ?? null,
       duration: meta.duration ?? null,
       width: meta.width ?? null,
       height: meta.height ?? null,
