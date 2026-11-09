@@ -16,6 +16,11 @@ export function createR2Client(cfg: R2Config): S3Client {
   return new S3Client({
     region: "auto",
     endpoint: `https://${cfg.accountId}.r2.cloudflarestorage.com`,
+    // R2 requires path-style addressing. Without this the SDK builds a
+    // virtual-hosted URL (https://<bucket>.<account>.r2.cloudflarestorage.com)
+    // whose hostname has no matching TLS certificate, so the handshake
+    // fails with SSL alert 40 before any S3 call is made.
+    forcePathStyle: true,
     credentials: {
       accessKeyId: cfg.accessKeyId,
       secretAccessKey: cfg.secretAccessKey,
