@@ -50,8 +50,13 @@ export async function downloadWithYtdlp(
     // installed in the Dockerfile).
     "--impersonate",
     "chrome",
+    // Highest quality + HEVC first: prefer the best HEVC (H.265)
+    // video + best audio; when the source has no HEVC version,
+    // fall back to the best video of any codec. No height cap —
+    // "max" quality (TikTok tops out at 1080p anyway). The old
+    // selector capped at 1080p and took any codec (usually H.264).
     "-f",
-    "bv*[height<=1080]+ba/b[height<=1080]/b",
+    "bv*[vcodec^=hevc]+ba/bv*+ba/b",
     "--merge-output-format",
     "mp4",
     "-o",

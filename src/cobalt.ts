@@ -2,7 +2,14 @@
  * Cobalt client — first resolver for a saved link.
  *
  * Uses the user's own instance (COBALT_URL, default the Railway instance).
- * POST / with { url, videoQuality: "max", downloadMode: "auto" }.
+ * POST / with { url, videoQuality: "max", downloadMode: "auto",
+ * allowH265: true }. "max" is the highest quality; allowH265 lets
+ * Cobalt return HEVC (H.265) when the source offers it — same quality
+ * at a smaller file, or a higher-quality 1080p. When no HEVC version
+ * exists it falls back to H.264 (verified: this video returns the
+ * same H.264 576x1024 file with or without the flag). The flag must
+ * be a JSON boolean — a string "true" is rejected (the old Shortcuts
+ * bug).
  *   status "tunnel" | "redirect" -> body.url is the direct file URL.
  *   status "picker"              -> body.picker[]; take the first video item.
  * Anything else is an error (e.g. error.api.content.post.age = age-restricted
@@ -45,6 +52,7 @@ export async function resolveWithCobalt(
       videoQuality: "max",
       downloadMode: "auto",
       filenameStyle: "basic",
+      allowH265: true,
     }),
     signal: AbortSignal.timeout(60_000),
   });
