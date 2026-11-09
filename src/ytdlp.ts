@@ -71,6 +71,35 @@ export interface ExpandedPlaylist {
 }
 
 /**
+ * Follow redirects (short links like vt.tiktok.com / vm.tiktok.com)
+ * to the canonical URL, without downloading the page body — only
+ * the `location` headers are read, so this is fast even when TikTok
+ * is slow for the server's IP. Returns the original URL when the
+ * chain cannot be followed (yt-dlp then resolves it itself).
+ * A short link to a collection must resolve to the real
+ * tiktok.com/.../collection/... URL for yt-dlp's tiktok:collection
+ * extractor to recognise it — the vm.tiktok extractor timed out on
+ * exactly this (2026-11-10, vt.tiktok.com short link).
+ */
+export async function resolveFinalUrl(pageUrl: string): Promise<string> {
+  try {
+    let current = pageUrl;
+    for (let hop = 0; hop < 5; hop++) {
+      const res = await fetch(current, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(10_000),
+      });
+      const loc = res.headers.get("location");
+      if (!loc) break;
+      current = new URL(loc, current).toString();
+    }
+    return current;
+  } catch {
+    return pageUrl;
+  }
+}
+
+/**
  * Expand a playlist/collection URL into its video URLs.
  * `yt-dlp --flat-playlist -J` returns one JSON object: `_type:
  * "playlist"` with `entries[]` (each with `webpage_url`), or a single
@@ -79,12 +108,40 @@ export interface ExpandedPlaylist {
  * extractor, and a user page works the same way. Rejects when the URL
  * is not a playlist/collection, is private, or yt-dlp cannot read it
  * (e.g. a challenge page). Capped at maxEntries.
+ *
+ * Short links are resolved to the canonical URL first (see
+ * resolveFinalUrl), the socket timeout is raised to 30s (TikTok is
+ * slow for datacenter IPs), and a failed attempt is retried once —
+ * a read timeout is often transient.
  */
-export function expandPlaylist(
+export async function expandPlaylist(
   pageUrl: string,
   bin: string,
   maxEntries = 100,
   timeoutMs = 120_000,
+): Promise<ExpandedPlaylist> {
+  const resolved = await resolveFinalUrl(pageUrl);
+  let lastError: Error = new Error("expand_failed: unknown");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await expandOnce(resolved, bin, maxEntries, timeoutMs);
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      if (attempt === 0) {
+        console.log(
+          JSON.stringify({ event: "expand_retry", url: resolved, error: lastError.message.slice(0, 200) }),
+        );
+      }
+    }
+  }
+  throw lastError;
+}
+
+function expandOnce(
+  pageUrl: string,
+  bin: string,
+  maxEntries: number,
+  timeoutMs: number,
 ): Promise<ExpandedPlaylist> {
   return new Promise((resolve, reject) => {
     let done = false;
@@ -98,6 +155,8 @@ export function expandPlaylist(
       [
         "--flat-playlist",
         "--no-warnings",
+        "--socket-timeout",
+        "30",
         "--playlist-end",
         String(maxEntries),
         "-J",
