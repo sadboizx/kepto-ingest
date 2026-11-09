@@ -32,6 +32,7 @@ import { join } from "node:path";
 import { resolveWithCobalt, type CobaltResult } from "./cobalt.js";
 import { downloadToFile, extFor, makeSlideshow, makeSprite, makeThumbnail, probe } from "./media.js";
 import { createR2Client, uploadFile } from "./r2.js";
+import { resolveWithTikwm } from "./tikwm.js";
 import { downloadWithYtdlp, dumpJsonMetadata, expandPlaylist, ytdlpAvailable, ytdlpVersion } from "./ytdlp.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -330,18 +331,41 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
       if (!(await ytdlpAvailable(YTDLP_BIN))) {
         throw new Error(`cobalt_failed_no_ytdlp: ${String(cobaltErr)}`);
       }
-      mediaPath = await downloadWithYtdlp(pageUrl, dir, YTDLP_BIN);
-      const st = await stat(mediaPath);
-      fileSize = st.size;
-      contentType = null;
-      // Hash the yt-dlp output for dedupe/verification.
-      sha256 = await new Promise<string>((resolve, reject) => {
-        const h = createHash("sha256");
-        const s = createReadStream(mediaPath);
-        s.on("data", (c: Buffer | string) => h.update(c));
-        s.on("end", () => resolve(h.digest("hex")));
-        s.on("error", reject);
-      });
+      try {
+        mediaPath = await downloadWithYtdlp(pageUrl, dir, YTDLP_BIN);
+        const st = await stat(mediaPath);
+        fileSize = st.size;
+        contentType = null;
+        // Hash the yt-dlp output for dedupe/verification.
+        sha256 = await new Promise<string>((resolve, reject) => {
+          const h = createHash("sha256");
+          const s = createReadStream(mediaPath);
+          s.on("data", (c: Buffer | string) => h.update(c));
+          s.on("end", () => resolve(h.digest("hex")));
+          s.on("error", reject);
+        });
+      } catch (ytdlpErr) {
+        // TikWM fallback (last resort): a plain HTTP API returning a
+        // direct no-watermark mp4. It handles age-restricted posts
+        // that anonymous Cobalt/yt-dlp cannot fetch (user suggestion
+        // 2026-11-10), and photo posts come back as TikTok's own
+        // pre-rendered slideshow video. If TikWM fails too, the job
+        // fails with its error (the yt-dlp error is in the log).
+        console.log(
+          JSON.stringify({
+            event: "tikwm_try",
+            item_id: itemId,
+            error: String(ytdlpErr).slice(0, 200),
+          }),
+        );
+        const tik = await resolveWithTikwm(pageUrl);
+        const dl = await downloadToFile(tik.playUrl, join(dir, `media.${extFor(null, tik.playUrl) || "mp4"}`));
+        mediaPath = dl.path;
+        contentType = dl.contentType;
+        fileSize = dl.fileSize;
+        sha256 = dl.sha256;
+        console.log(JSON.stringify({ event: "tikwm_used", item_id: itemId }));
+      }
     }
 
     // 2. Probe + thumbnail + scrub sprite (thumbnail/sprite failure is non-fatal).
