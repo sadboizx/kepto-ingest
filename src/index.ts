@@ -312,10 +312,13 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
 
     // 1. Resolve to a direct media URL, then download it — or let yt-dlp
     //    download it directly (needed for HLS / login-walled sources).
-    let mediaPath: string;
-    let contentType: string | null;
-    let fileSize: number;
-    let sha256: string;
+    // Defaults are overwritten on every success path below; a failure
+    // throws out of the try/catch (to the outer ingest_failed handler)
+    // so the defaults are never uploaded.
+    let mediaPath = "";
+    let contentType: string | null = null;
+    let fileSize = 0;
+    let sha256 = "";
     let cobaltFilename: string | undefined;
     try {
       const resolved = await resolveWithCobaltChain(pageUrl, itemId);
@@ -328,36 +331,14 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
       sha256 = dl.sha256;
     } catch (cobaltErr) {
       // The chain already logged each cobalt_failed (per instance).
-      if (!(await ytdlpAvailable(YTDLP_BIN))) {
-        throw new Error(`cobalt_failed_no_ytdlp: ${String(cobaltErr)}`);
-      }
-      try {
-        mediaPath = await downloadWithYtdlp(pageUrl, dir, YTDLP_BIN);
-        const st = await stat(mediaPath);
-        fileSize = st.size;
-        contentType = null;
-        // Hash the yt-dlp output for dedupe/verification.
-        sha256 = await new Promise<string>((resolve, reject) => {
-          const h = createHash("sha256");
-          const s = createReadStream(mediaPath);
-          s.on("data", (c: Buffer | string) => h.update(c));
-          s.on("end", () => resolve(h.digest("hex")));
-          s.on("error", reject);
-        });
-      } catch (ytdlpErr) {
-        // TikWM fallback (last resort): a plain HTTP API returning a
-        // direct no-watermark mp4. It handles age-restricted posts
-        // that anonymous Cobalt/yt-dlp cannot fetch (user suggestion
-        // 2026-11-10), and photo posts come back as TikTok's own
-        // pre-rendered slideshow video. If TikWM fails too, the job
-        // fails with its error (the yt-dlp error is in the log).
-        console.log(
-          JSON.stringify({
-            event: "tikwm_try",
-            item_id: itemId,
-            error: String(ytdlpErr).slice(0, 200),
-          }),
-        );
+      const cobaltMsg = String(cobaltErr);
+      // TikWM download (shared by both paths below): a plain HTTP API
+      // returning a direct no-watermark mp4. It handles age-restricted
+      // posts that anonymous Cobalt/yt-dlp cannot fetch (user
+      // suggestion 2026-11-10), and photo posts come back as TikTok's
+      // own pre-rendered slideshow video.
+      const tryTikwm = async (reason: string): Promise<void> => {
+        console.log(JSON.stringify({ event: "tikwm_try", item_id: itemId, reason }));
         const tik = await resolveWithTikwm(pageUrl);
         const dl = await downloadToFile(tik.playUrl, join(dir, `media.${extFor(null, tik.playUrl) || "mp4"}`));
         mediaPath = dl.path;
@@ -365,6 +346,44 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
         fileSize = dl.fileSize;
         sha256 = dl.sha256;
         console.log(JSON.stringify({ event: "tikwm_used", item_id: itemId }));
+      };
+      // Age-restricted (Cobalt reports error.api.content.post.age):
+      // yt-dlp cannot fetch it anonymously either, so skip yt-dlp
+      // entirely and go straight to TikWM (user request 2026-11-10).
+      // Running yt-dlp on an age-gated post just burns 10-30s before
+      // failing the same way.
+      if (/post\.age|age[-_ ]restricted/i.test(cobaltMsg)) {
+        await tryTikwm("age");
+      } else {
+        if (!(await ytdlpAvailable(YTDLP_BIN))) {
+          throw new Error(`cobalt_failed_no_ytdlp: ${cobaltMsg}`);
+        }
+        try {
+          mediaPath = await downloadWithYtdlp(pageUrl, dir, YTDLP_BIN);
+          const st = await stat(mediaPath);
+          fileSize = st.size;
+          contentType = null;
+          // Hash the yt-dlp output for dedupe/verification.
+          sha256 = await new Promise<string>((resolve, reject) => {
+            const h = createHash("sha256");
+            const s = createReadStream(mediaPath);
+            s.on("data", (c: Buffer | string) => h.update(c));
+            s.on("end", () => resolve(h.digest("hex")));
+            s.on("error", reject);
+          });
+        } catch (ytdlpErr) {
+          // yt-dlp failed too: TikWM is the last resort. If it fails
+          // as well the job fails with its error (the yt-dlp error is
+          // in the log).
+          console.log(
+            JSON.stringify({
+              event: "ytdlp_failed",
+              item_id: itemId,
+              error: String(ytdlpErr).slice(0, 200),
+            }),
+          );
+          await tryTikwm("ytdlp_failed");
+        }
       }
     }
 
