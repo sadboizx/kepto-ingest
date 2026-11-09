@@ -48,3 +48,73 @@ export async function downloadWithYtdlp(
   if (!files.length) throw new Error("ytdlp_no_output");
   return join(outDir, files[0]);
 }
+
+export interface YtDlpMetadata {
+  uploaderId?: string;
+  uploader?: string;
+  title?: string;
+  description?: string;
+  /** Original upload date as YYYYMMDD, when the extractor provides it. */
+  uploadDate?: string;
+}
+
+/**
+ * Metadata-only probe: `--dump-json --skip-download` returns the extractor's
+ * title / description / uploader / uploader_id / upload_date without
+ * downloading any bytes. Best-effort by design — many platforms block
+ * yt-dlp from a datacenter IP, so ANY failure (spawn error, timeout,
+ * non-zero exit, bad JSON) resolves to `{}` instead of rejecting.
+ * Never let metadata kill a job whose media already downloaded.
+ */
+export function dumpJsonMetadata(
+  pageUrl: string,
+  bin: string,
+  timeoutMs = 15_000,
+): Promise<YtDlpMetadata> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v: YtDlpMetadata) => {
+      if (done) return;
+      done = true;
+      resolve(v);
+    };
+    const p = spawn(
+      bin,
+      ["--no-playlist", "--no-warnings", "--skip-download", "--dump-json", pageUrl],
+      { stdio: "pipe" },
+    );
+    let out = "";
+    const timer = setTimeout(() => {
+      try {
+        p.kill("SIGKILL");
+      } catch {
+        // Already gone — finish() below handles it.
+      }
+      finish({});
+    }, timeoutMs);
+    p.stdout?.on("data", (d: Buffer) => {
+      out += d.toString();
+    });
+    p.on("error", () => {
+      clearTimeout(timer);
+      finish({});
+    });
+    p.on("close", () => {
+      clearTimeout(timer);
+      try {
+        const j = JSON.parse(out) as Record<string, unknown>;
+        const pick = (k: string): string | undefined =>
+          typeof j[k] === "string" ? (j[k] as string) : undefined;
+        finish({
+          uploaderId: pick("uploader_id"),
+          uploader: pick("uploader"),
+          title: pick("title"),
+          description: pick("description"),
+          uploadDate: pick("upload_date"),
+        });
+      } catch {
+        finish({});
+      }
+    });
+  });
+}

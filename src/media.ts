@@ -115,6 +115,54 @@ export function makeThumbnail(
   });
 }
 
+export interface SpriteResult {
+  ok: boolean;
+  /** Frames actually in the sprite (from duration; capped at cols*rows). */
+  count: number;
+}
+
+/**
+ * Scrub-preview sprite: one frame every `intervalSeconds`, scaled to
+ * 160px wide, tiled into a `cols` x `rows` grid in a single JPEG.
+ * The iOS player crops one cell per scrub timestamp (frame index =
+ * floor(seconds / interval), col = index % cols, row = floor(index / cols)).
+ * Failure is non-fatal — the player just shows no preview for that item.
+ * When duration is unknown the frame count is unknowable, so `count` falls
+ * back to cols*rows (the player clamps to the last cell; trailing cells
+ * may be blank for short videos — probe almost always returns a duration).
+ */
+export function makeSprite(
+  filePath: string,
+  spritePath: string,
+  duration: number | null,
+  intervalSeconds = 5,
+  cols = 5,
+  rows = 4,
+): Promise<SpriteResult> {
+  const count =
+    duration && duration > 0
+      ? Math.min(Math.ceil(duration / intervalSeconds), cols * rows)
+      : cols * rows;
+  return new Promise((resolve) => {
+    const p = spawn("ffmpeg", [
+      "-y",
+      "-v",
+      "error",
+      "-i",
+      filePath,
+      "-vf",
+      `fps=1/${intervalSeconds},scale=160:-1,tile=${cols}x${rows}`,
+      "-frames:v",
+      "1",
+      "-q:v",
+      "5",
+      spritePath,
+    ]);
+    p.on("error", () => resolve({ ok: false, count: 0 }));
+    p.on("close", (code) => resolve({ ok: code === 0, count: code === 0 ? count : 0 }));
+  });
+}
+
 /** Extension for an R2 key from a content type or a Cobalt filename. */
 export function extFor(contentType: string | null, filename?: string): string {
   if (filename) {

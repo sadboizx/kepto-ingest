@@ -9,6 +9,15 @@
  * The Worker never downloads video and the iOS app never uploads; this
  * service is the only place that touches the media bytes.
  *
+ * Per job, besides the media it also produces:
+ * - a thumbnail (thumb.jpg, frame at 1s)
+ * - a scrub-preview sprite (sprite.jpg, one frame every 5s tiled 5x4)
+ * - author metadata: the creator's handle (from the resolved URL, e.g.
+ *   vt.tiktok.com redirects to tiktok.com/@handle/video/..., or from
+ *   yt-dlp's uploader_id) + display name / title / caption / posted date
+ *   from yt-dlp --dump-json when it works. Metadata is best-effort:
+ *   it never fails a job whose media already downloaded.
+ *
  * Env (see .env.example — no secrets in code):
  *   INGEST_TOKEN, KEPTO_WORKER_URL, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
  *   R2_SECRET_ACCESS_KEY, R2_BUCKET, COBALT_URL, COBALT_API_KEY,
@@ -21,9 +30,9 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveWithCobalt } from "./cobalt.js";
-import { downloadToFile, extFor, makeThumbnail, probe } from "./media.js";
+import { downloadToFile, extFor, makeSprite, makeThumbnail, probe } from "./media.js";
 import { createR2Client, uploadFile } from "./r2.js";
-import { downloadWithYtdlp, ytdlpAvailable } from "./ytdlp.js";
+import { downloadWithYtdlp, dumpJsonMetadata, ytdlpAvailable } from "./ytdlp.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const INGEST_TOKEN = process.env.INGEST_TOKEN ?? "";
@@ -33,6 +42,11 @@ const COBALT_URL = process.env.COBALT_URL ?? "https://cobalt.up.railway.app/";
 const COBALT_API_KEY = process.env.COBALT_API_KEY ?? "";
 const YTDLP_BIN = process.env.YTDLP_BIN ?? "yt-dlp";
 const MAX_CONCURRENT = 2;
+
+/** Scrub sprite geometry — must match what the iOS player expects. */
+const SPRITE_INTERVAL_SECONDS = 5;
+const SPRITE_COLS = 5;
+const SPRITE_ROWS = 4;
 
 const r2 =
   process.env.R2_ACCOUNT_ID &&
@@ -109,6 +123,62 @@ async function callback(body: Record<string, unknown>): Promise<void> {
   if (!res.ok) throw new Error(`callback_http_${res.status}`);
 }
 
+interface GatheredMeta {
+  authorUsername?: string;
+  author?: string;
+  title?: string;
+  caption?: string;
+  postedAt?: string | null;
+}
+
+/**
+ * Creator handle from the URL itself: short links (vt.tiktok.com/...) redirect
+ * to the canonical tiktok.com/@handle/video/... URL, and full TikTok links
+ * already contain @handle. Follows up to 3 redirects without downloading
+ * anything; any failure returns null.
+ */
+async function resolveUsernameFromUrl(pageUrl: string): Promise<string | null> {
+  try {
+    let current = pageUrl;
+    for (let hop = 0; hop < 3; hop++) {
+      const res = await fetch(current, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(10_000),
+      });
+      const loc = res.headers.get("location");
+      if (!loc) break;
+      current = new URL(loc, current).toString();
+    }
+    const m = /@([A-Za-z0-9._]{1,30})/.exec(current);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Author + title metadata for a saved link. Runs the URL-redirect check and
+ * yt-dlp --dump-json in parallel; both are best-effort (a platform that
+ * blocks yt-dlp from a datacenter IP just yields no metadata). Never rejects.
+ */
+async function gatherMetadata(pageUrl: string): Promise<GatheredMeta> {
+  const [username, yt] = await Promise.all([
+    resolveUsernameFromUrl(pageUrl),
+    dumpJsonMetadata(pageUrl, YTDLP_BIN),
+  ]);
+  let postedAt: string | null = null;
+  if (yt.uploadDate && /^\d{8}$/.test(yt.uploadDate)) {
+    postedAt = `${yt.uploadDate.slice(0, 4)}-${yt.uploadDate.slice(4, 6)}-${yt.uploadDate.slice(6, 8)}T00:00:00Z`;
+  }
+  return {
+    authorUsername: username ?? yt.uploaderId,
+    author: yt.uploader,
+    title: yt.title,
+    caption: yt.description?.slice(0, 500),
+    postedAt,
+  };
+}
+
 async function runJob(itemId: string, pageUrl: string): Promise<void> {
   active++;
   const dir = await mkdtemp(join(tmpdir(), "kepto-"));
@@ -118,6 +188,10 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
     }
     if (!r2) throw new Error("r2_not_configured");
     console.log(JSON.stringify({ event: "ingest_start", item_id: itemId, url: pageUrl }));
+
+    // Metadata runs in parallel with the download (started now, awaited
+    // later) so it adds no latency in the common case.
+    const metaPromise = gatherMetadata(pageUrl);
 
     // 1. Resolve to a direct media URL, then download it — or let yt-dlp
     //    download it directly (needed for HLS / login-walled sources).
@@ -156,30 +230,54 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
       });
     }
 
-    // 2. Probe + thumbnail (thumbnail failure is non-fatal).
+    // 2. Probe + thumbnail + scrub sprite (thumbnail/sprite failure is non-fatal).
     const meta = await probe(mediaPath);
+    const gathered = await metaPromise;
     const ext = extFor(contentType, cobaltFilename) || mediaPath.split(".").pop() || "mp4";
     const thumbPath = join(dir, "thumb.jpg");
     const hasThumb = await makeThumbnail(mediaPath, thumbPath, 1);
     const r2Key = `users/me/items/${itemId}/original.${ext}`;
     const thumbKey = hasThumb ? `users/me/items/${itemId}/thumb.jpg` : null;
+    const spritePath = join(dir, "sprite.jpg");
+    const sprite = await makeSprite(
+      mediaPath,
+      spritePath,
+      meta.duration ?? null,
+      SPRITE_INTERVAL_SECONDS,
+      SPRITE_COLS,
+      SPRITE_ROWS,
+    );
+    const previewKey = sprite.ok ? `users/me/items/${itemId}/sprite.jpg` : null;
 
     // 3. Upload straight to R2, then tell the Worker the item is ready.
     await uploadFile(r2, R2_BUCKET, r2Key, mediaPath, contentType ?? "video/mp4");
     if (hasThumb && thumbKey) {
       await uploadFile(r2, R2_BUCKET, thumbKey, thumbPath, "image/jpeg");
     }
+    if (sprite.ok && previewKey) {
+      await uploadFile(r2, R2_BUCKET, previewKey, spritePath, "image/jpeg");
+    }
     console.log(JSON.stringify({ event: "ingest_ready", item_id: itemId, r2_key: r2Key, file_size: fileSize }));
     await callback({
       item_id: itemId,
       r2_key: r2Key,
       thumb_key: thumbKey,
+      preview_key: previewKey,
       content_type: contentType ?? "video/mp4",
+      title: gathered.title ?? null,
+      caption: gathered.caption ?? null,
+      author: gathered.author ?? null,
+      author_username: gathered.authorUsername ?? null,
+      posted_at: gathered.postedAt ?? null,
       duration: meta.duration ?? null,
       width: meta.width ?? null,
       height: meta.height ?? null,
       file_size: fileSize,
       sha256,
+      preview_cols: sprite.ok ? SPRITE_COLS : null,
+      preview_rows: sprite.ok ? SPRITE_ROWS : null,
+      preview_interval: sprite.ok ? SPRITE_INTERVAL_SECONDS : null,
+      preview_count: sprite.ok ? sprite.count : null,
     });
   } catch (e) {
     const message = String(e instanceof Error ? e.message : e).slice(0, 500);
