@@ -398,6 +398,23 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
             s.on("end", () => resolve(h.digest("hex")));
             s.on("error", reject);
           });
+          // yt-dlp sometimes returns audio only — TikTok photo posts
+          // expose no video format, just an mp3 + the photos. Cobalt
+          // already failed (error.api.fetch.empty / no_valid_content),
+          // so try TikWM next: it returns TikTok's own pre-rendered
+          // slideshow video for photo posts. If TikWM fails too, keep
+          // the yt-dlp audio — the slideshow builder below will try to
+          // rescue it from the photos, and only then fail with
+          // audio_only_no_video. (User correction 2026-11-10: a Cobalt
+          // failure must fall through to yt-dlp AND TikWM, not stop at
+          // the audio-only download.)
+          if (!(await probe(mediaPath)).width) {
+            try {
+              await tryTikwm("audio_only");
+            } catch {
+              // Keep the yt-dlp audio file; the slideshow path handles it.
+            }
+          }
         } catch (ytdlpErr) {
           // yt-dlp failed too: TikWM is the last resort. If it fails
           // as well the job fails with its error (the yt-dlp error is
