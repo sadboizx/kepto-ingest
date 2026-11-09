@@ -49,7 +49,18 @@ export async function resolveWithCobalt(
     signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) {
-    throw new Error(`cobalt_http_${res.status}`);
+    // Cobalt returns HTTP 400 for content errors and puts the real
+    // reason in the JSON body (e.g. error.api.content.post.age for an
+    // age-restricted post). Include that code — a bare http_400 tells
+    // nothing about WHY the link failed.
+    let code = `http_${res.status}`;
+    try {
+      const errBody = (await res.json()) as CobaltResponse;
+      if (errBody.error?.code) code = errBody.error.code;
+    } catch {
+      // Body is not JSON; keep the HTTP status.
+    }
+    throw new Error(`cobalt_${code}`);
   }
   const data = (await res.json()) as CobaltResponse;
   if ((data.status === "tunnel" || data.status === "redirect") && data.url) {

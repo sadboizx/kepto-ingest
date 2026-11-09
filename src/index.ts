@@ -32,7 +32,7 @@ import { join } from "node:path";
 import { resolveWithCobalt } from "./cobalt.js";
 import { downloadToFile, extFor, makeSprite, makeThumbnail, probe } from "./media.js";
 import { createR2Client, uploadFile } from "./r2.js";
-import { downloadWithYtdlp, dumpJsonMetadata, ytdlpAvailable } from "./ytdlp.js";
+import { downloadWithYtdlp, dumpJsonMetadata, ytdlpAvailable, ytdlpVersion } from "./ytdlp.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const INGEST_TOKEN = process.env.INGEST_TOKEN ?? "";
@@ -297,4 +297,7 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
 
 app.listen(PORT, () => {
   console.log(`[kepto-ingest] listening on :${PORT}`);
+  void ytdlpVersion(YTDLP_BIN).then((version) => {
+    console.log(JSON.stringify({ event: "ytdlp_version", version }));
+  });
 });

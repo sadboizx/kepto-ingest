@@ -16,6 +16,22 @@ export function ytdlpAvailable(bin: string): Promise<boolean> {
   });
 }
 
+/// The installed yt-dlp version (e.g. "2026.10.26"), or null when the
+/// binary is missing. Logged once at startup: yt-dlp's TikTok error
+/// text is version-dependent, so this pins down which build a log
+/// line came from.
+export function ytdlpVersion(bin: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const p = spawn(bin, ["--version"]);
+    let out = "";
+    p.stdout?.on("data", (d: Buffer) => {
+      out += d.toString();
+    });
+    p.on("error", () => resolve(null));
+    p.on("close", (code) => resolve(code === 0 ? out.trim() || null : null));
+  });
+}
+
 export async function downloadWithYtdlp(
   pageUrl: string,
   outDir: string,
