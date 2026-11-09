@@ -257,7 +257,7 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
     if (sprite.ok && previewKey) {
       await uploadFile(r2, R2_BUCKET, previewKey, spritePath, "image/jpeg");
     }
-    console.log(JSON.stringify({ event: "ingest_ready", item_id: itemId, r2_key: r2Key, file_size: fileSize }));
+    console.log(JSON.stringify({ event: "ingest_ready", item_id: itemId, r2_key: r2Key, file_size: fileSize, has_audio: meta.hasAudio ?? null, sprite_ok: sprite.ok, sprite_frames: sprite.count }));
     await callback({
       item_id: itemId,
       r2_key: r2Key,

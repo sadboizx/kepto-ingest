@@ -53,6 +53,8 @@ export interface ProbeResult {
   duration?: number;
   width?: number;
   height?: number;
+  /** True when the file has an audio stream (diagnoses "video has no sound"). */
+  hasAudio?: boolean;
 }
 
 export function probe(filePath: string): Promise<ProbeResult> {
@@ -82,6 +84,7 @@ export function probe(filePath: string): Promise<ProbeResult> {
           duration: j.format?.duration ? Number(j.format.duration) : undefined,
           width: video?.width,
           height: video?.height,
+          hasAudio: j.streams?.some((s) => s.codec_type === "audio"),
         });
       } catch {
         resolve({});
