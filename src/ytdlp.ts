@@ -145,6 +145,38 @@ export async function expandPlaylist(
   throw lastError;
 }
 
+/**
+ * The folder name for a saved TikTok Collection: the collection's own
+ * TikTok title, NOT "<username>-<title>" (that is what yt-dlp puts in
+ * the playlist title, e.g. "choayphoquenkodoxang-test"). Prefer the
+ * collection slug from the URL (/collection/<name>-<numeric-id> ->
+ * <name>); fall back to stripping the "<username>-" prefix from
+ * yt-dlp's title (TikTok usernames never contain "-", so the first
+ * "-" is the separator). Returns undefined when neither yields a name.
+ */
+function cleanCollectionTitle(pageUrl: string, ytTitle?: string): string | undefined {
+  try {
+    const u = new URL(pageUrl);
+    const m = /\/collection\/([^/?#]+)/i.exec(u.pathname);
+    if (m) {
+      const slug = decodeURIComponent(m[1]);
+      // Strip the trailing numeric id ("test-7706255745959856916" -> "test").
+      const name = slug.replace(/-\d+$/, "");
+      if (name) return name;
+    }
+  } catch {
+    // Fall through to the title.
+  }
+  if (ytTitle) {
+    const idx = ytTitle.indexOf("-");
+    if (idx > 0 && idx < ytTitle.length - 1) {
+      return ytTitle.slice(idx + 1);
+    }
+    return ytTitle;
+  }
+  return undefined;
+}
+
 function expandOnce(
   pageUrl: string,
   bin: string,
@@ -225,7 +257,7 @@ function expandOnce(
             return;
           }
           resolve({
-            title: typeof j.title === "string" ? j.title : undefined,
+            title: cleanCollectionTitle(pageUrl, typeof j.title === "string" ? j.title : undefined),
             urls: urls.slice(0, maxEntries),
           });
         } catch {
