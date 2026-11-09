@@ -40,6 +40,11 @@ export async function downloadWithYtdlp(
   const args = [
     "--no-playlist",
     "--no-warnings",
+    // Impersonate Chrome so TikTok serves the media instead of a
+    // challenge/empty page to a datacenter IP (needs curl-cffi,
+    // installed in the Dockerfile).
+    "--impersonate",
+    "chrome",
     "-f",
     "bv*[height<=1080]+ba/b[height<=1080]/b",
     "--merge-output-format",
@@ -131,6 +136,9 @@ export async function expandPlaylist(
         console.log(
           JSON.stringify({ event: "expand_retry", url: resolved, error: lastError.message.slice(0, 200) }),
         );
+        // Wait before retrying: TikTok rate-limits datacenter IPs,
+        // and an immediate retry hits the same empty response.
+        await new Promise((r) => setTimeout(r, 5_000));
       }
     }
   }
@@ -155,6 +163,12 @@ function expandOnce(
       [
         "--flat-playlist",
         "--no-warnings",
+        // Impersonate Chrome (needs curl-cffi, installed in the
+        // Dockerfile): TikTok returns an empty JSON body to a bare
+        // datacenter IP, which the tiktok:collection extractor
+        // cannot parse ("Failed to parse JSON", 2026-11-10).
+        "--impersonate",
+        "chrome",
         "--socket-timeout",
         "30",
         "--playlist-end",
@@ -255,7 +269,7 @@ export function dumpJsonMetadata(
     };
     const p = spawn(
       bin,
-      ["--no-playlist", "--no-warnings", "--skip-download", "--dump-json", pageUrl],
+      ["--no-playlist", "--no-warnings", "--impersonate", "chrome", "--skip-download", "--dump-json", pageUrl],
       { stdio: "pipe" },
     );
     let out = "";
