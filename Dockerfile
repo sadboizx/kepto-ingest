@@ -1,3 +1,14 @@
+# Build stage: install all deps (incl. dev) so tsc is available
+FROM node:24-slim AS build
+
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npx tsc
+
+# Runtime stage: only production deps + ffmpeg/yt-dlp
 FROM node:24-slim
 
 RUN apt-get update \
@@ -7,10 +18,8 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install --omit=dev
-COPY tsconfig.json ./
-COPY src ./src
-RUN npx tsc
+RUN npm ci --omit=dev
+COPY --from=build /app/dist ./dist
 
 ENV NODE_ENV=production
 EXPOSE 3000
