@@ -29,12 +29,12 @@
  */
 import express from "express";
 import { createHash } from "node:crypto";
-import { chmodSync, createReadStream, writeFileSync } from "node:fs";
+import { chmodSync, createReadStream, createWriteStream, writeFileSync } from "node:fs";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveWithCobalt, type CobaltResult } from "./cobalt.js";
-import { downloadToFile, extFor, makeSlideshow, makeSprite, makeThumbnail, probe } from "./media.js";
+import { downloadToFile, extFor, makeSlideshow, makeSprite, makeThumbnail, normalizeImageToJpeg, probe } from "./media.js";
 import { createR2Client, uploadFile } from "./r2.js";
 import { resolveWithTikwm } from "./tikwm.js";
 import { downloadWithYtdlp, dumpJsonMetadata, expandPlaylist, ytdlpAvailable, ytdlpVersion } from "./ytdlp.js";
@@ -248,6 +248,65 @@ app.post("/expand-collection", async (req, res) => {
   }
 });
 
+/**
+ * POST /upload — receive a raw file upload from the device Albums.
+ * The Worker (not the app) calls this: the app uploads to the Worker,
+ * which streams the body through with Bearer <redacted> Query:
+ * item_id (a pending "album" item the Worker created), filename.
+ * The body is the raw file bytes (Content-Type = the file's MIME type).
+ * The file is streamed to disk (never buffered in memory), probed,
+ * thumbnailed (+ a scrub sprite for videos), uploaded to R2, and the
+ * Worker is called back at /api/ingest-complete. Synchronous: the
+ * Worker (and the app) wait for the whole process and get the
+ * definitive result. Auth: Bearer <redacted> (same as /ingest).
+ */
+app.post("/upload", async (req, res) => {
+  if (!authed(req)) return res.status(401).json({ ok: false, error: "Unauthorized." });
+  const itemId = typeof req.query.item_id === "string" ? req.query.item_id : "";
+  const filename = typeof req.query.filename === "string" ? req.query.filename : "upload";
+  if (!itemId) return res.status(422).json({ ok: false, error: "item_id is required." });
+  const contentType = req.headers["content-type"] ?? "application/octet-stream";
+  const dir = await mkdtemp(join(tmpdir(), "kepto-upload-"));
+  const ext = extFor(contentType, filename) || "mp4";
+  const mediaPath = join(dir, `upload.${ext}`);
+  try {
+    // Stream the request body straight to disk — the file can be tens
+    // of MB, so it must not be buffered in memory. express.json() only
+    // parses application/json, so a file Content-Type reaches us as a
+    // raw stream here.
+    await new Promise<void>((resolve, reject) => {
+      const ws = createWriteStream(mediaPath);
+      req.pipe(ws);
+      ws.on("finish", resolve);
+      ws.on("error", reject);
+      req.on("error", reject);
+    });
+    const st = await stat(mediaPath);
+    if (st.size === 0) throw new Error("empty_upload");
+    const sha256 = await new Promise<string>((resolve, reject) => {
+      const h = createHash("sha256");
+      const s = createReadStream(mediaPath);
+      s.on("data", (c: Buffer | string) => h.update(c));
+      s.on("end", () => resolve(h.digest("hex")));
+      s.on("error", reject);
+    });
+    await runUpload(itemId, mediaPath, filename, contentType, st.size, sha256, dir);
+    return res.json({ ok: true, item_id: itemId, status: "ready" });
+  } catch (e) {
+    const message = String(e instanceof Error ? e.message : e).slice(0, 500);
+    console.error(JSON.stringify({ event: "upload_failed", item_id: itemId, error: message }));
+    try {
+      await callback({ item_id: itemId, error: message });
+    } catch {
+      // The Worker marks the item failed from the 422 below when the
+      // callback itself fails; nothing more to do here.
+    }
+    return res.status(422).json({ ok: false, error: message });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 async function callback(body: Record<string, unknown>): Promise<void> {
   if (!KEPTO_WORKER_URL) throw new Error("KEPTO_WORKER_URL not set");
   const res = await fetch(`${KEPTO_WORKER_URL}/api/ingest-complete`, {
@@ -324,6 +383,134 @@ async function gatherMetadata(pageUrl: string): Promise<GatheredMeta> {
   };
 }
 
+/**
+ * TikWM only understands TikTok URLs (tiktok.com incl. vt/vm short
+ * links, and Douyin). A Facebook/Instagram/YouTube link that reaches
+ * the TikWM fallback (Cobalt + yt-dlp both failed) is NOT a TikTok
+ * link — calling TikWM just produces the confusing
+ * "tikwm_Url parsing is failed! Please check url." error. Callers check
+ * this first and surface the real (Cobalt/yt-dlp) error instead.
+ */
+function isTikTokUrl(pageUrl: string): boolean {
+  try {
+    const host = new URL(pageUrl).hostname.toLowerCase();
+    return host === "tiktok.com" || host.endsWith(".tiktok.com") || host.includes("douyin.com");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Finish an uploaded file (from POST /upload): probe it, build a
+ * thumbnail (+ a scrub sprite for videos), upload the original +
+ * thumbnail (+ sprite) to R2, and call the Worker back so the item
+ * becomes ready. Images keep their original file (content_type
+ * image/*) and the thumbnail IS the image itself (normalized to JPEG,
+ * so the feed's full-image view gets a real JPEG); videos get a 1s
+ * thumbnail + a sprite exactly like a link ingest. Throws on failure
+ * (the /upload handler reports it to the Worker).
+ */
+async function runUpload(
+  itemId: string,
+  mediaPath: string,
+  filename: string,
+  contentType: string,
+  fileSize: number,
+  sha256: string,
+  dir: string,
+): Promise<void> {
+  if (!r2) throw new Error("r2_not_configured");
+  const isImage =
+    /^image\//i.test(contentType) ||
+    /\.(jpe?g|png|webp|gif|heic|heif|avif)$/i.test(filename);
+  const meta = await probe(mediaPath);
+  if (!meta.width || !meta.height) {
+    throw new Error("no_video_stream");
+  }
+  const ext = extFor(contentType, filename) || mediaPath.split(".").pop() || "mp4";
+  const r2Key = `users/me/items/${itemId}/original.${ext}`;
+  const thumbPath = join(dir, "thumb.jpg");
+  let thumbKey: string | null = null;
+  let previewKey: string | null = null;
+  let previewCols: number | null = null;
+  let previewRows: number | null = null;
+  let previewInterval: number | null = null;
+  let previewCount: number | null = null;
+  if (isImage) {
+    // The thumbnail is the image itself (normalized to JPEG). No sprite
+    // for a still. The thumbnail is load-bearing here: the feed's
+    // full-image view loads /api/thumb/:id, so a missing thumb means a
+    // ready item that shows nothing — fail the job instead.
+    const hasThumb = await normalizeImageToJpeg(mediaPath, thumbPath);
+    if (!hasThumb) throw new Error("thumbnail_failed");
+    thumbKey = `users/me/items/${itemId}/thumb.jpg`;
+  } else {
+    const hasThumb = await makeThumbnail(mediaPath, thumbPath, 1);
+    if (hasThumb) thumbKey = `users/me/items/${itemId}/thumb.jpg`;
+    const spritePath = join(dir, "sprite.jpg");
+    const spriteInterval =
+      meta.duration && meta.duration > 0
+        ? Math.max(1, meta.duration / SPRITE_MAX_FRAMES)
+        : 1;
+    const spriteCount =
+      meta.duration && meta.duration > 0
+        ? Math.min(Math.ceil(meta.duration / spriteInterval), SPRITE_MAX_FRAMES)
+        : SPRITE_MAX_FRAMES;
+    const spriteRows = Math.ceil(spriteCount / SPRITE_COLS);
+    const sprite = await makeSprite(
+      mediaPath,
+      spritePath,
+      meta.duration ?? null,
+      spriteInterval,
+      SPRITE_COLS,
+      spriteRows,
+    );
+    if (sprite.ok) {
+      previewKey = `users/me/items/${itemId}/sprite.jpg`;
+      previewCols = SPRITE_COLS;
+      previewRows = spriteRows;
+      previewInterval = spriteInterval;
+      previewCount = sprite.count;
+      await uploadFile(r2, R2_BUCKET, previewKey, spritePath, "image/jpeg");
+    }
+  }
+  await uploadFile(r2, R2_BUCKET, r2Key, mediaPath, contentType);
+  if (thumbKey) {
+    await uploadFile(r2, R2_BUCKET, thumbKey, thumbPath, "image/jpeg");
+  }
+  console.log(
+    JSON.stringify({
+      event: "upload_ready",
+      item_id: itemId,
+      r2_key: r2Key,
+      file_size: fileSize,
+      is_image: isImage,
+    }),
+  );
+  await callback({
+    item_id: itemId,
+    r2_key: r2Key,
+    thumb_key: thumbKey,
+    preview_key: previewKey,
+    content_type: contentType,
+    title: filename,
+    caption: null,
+    author: null,
+    author_username: null,
+    posted_at: null,
+    view_count: null,
+    duration: meta.duration ?? null,
+    width: meta.width ?? null,
+    height: meta.height ?? null,
+    file_size: fileSize,
+    sha256,
+    preview_cols: previewCols,
+    preview_rows: previewRows,
+    preview_interval: previewInterval,
+    preview_count: previewCount,
+  });
+}
+
 async function runJob(itemId: string, pageUrl: string): Promise<void> {
   // runJob is only started by pumpQueue / the /ingest handler when
   // active < MAX_CONCURRENT, so no busy check is needed here.
@@ -380,7 +567,14 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
       // Running yt-dlp on an age-gated post just burns 10-30s before
       // failing the same way.
       if (/post\.age|age[-_ ]restricted/i.test(cobaltMsg)) {
-        await tryTikwm("age");
+        // TikWM is TikTok-only. An age error on a non-TikTok link is
+        // not something TikWM can fix — fail with the Cobalt error
+        // instead of TikWM's confusing "Url parsing is failed".
+        if (isTikTokUrl(pageUrl)) {
+          await tryTikwm("age");
+        } else {
+          throw new Error(cobaltMsg);
+        }
       } else {
         if (!(await ytdlpAvailable(YTDLP_BIN))) {
           throw new Error(`cobalt_failed_no_ytdlp: ${cobaltMsg}`);
@@ -409,10 +603,15 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
           // failure must fall through to yt-dlp AND TikWM, not stop at
           // the audio-only download.)
           if (!(await probe(mediaPath)).width) {
-            try {
-              await tryTikwm("audio_only");
-            } catch {
-              // Keep the yt-dlp audio file; the slideshow path handles it.
+            // TikWM only handles TikTok URLs. For a non-TikTok link,
+            // skip it and go straight to the slideshow rescue below
+            // (it builds from the photos yt-dlp found, if any).
+            if (isTikTokUrl(pageUrl)) {
+              try {
+                await tryTikwm("audio_only");
+              } catch {
+                // Keep the yt-dlp audio file; the slideshow path handles it.
+              }
             }
           }
         } catch (ytdlpErr) {
@@ -426,7 +625,14 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
               error: String(ytdlpErr).slice(0, 200),
             }),
           );
-          await tryTikwm("ytdlp_failed");
+          // TikWM only handles TikTok URLs. For a non-TikTok link,
+          // TikWM would just fail with "Url parsing is failed" —
+          // surface the real yt-dlp error instead.
+          if (isTikTokUrl(pageUrl)) {
+            await tryTikwm("ytdlp_failed");
+          } else {
+            throw ytdlpErr;
+          }
         }
       }
     }
