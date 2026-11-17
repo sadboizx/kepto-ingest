@@ -796,7 +796,16 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
     const gathered = await metaPromise;
     const ext = extFor(contentType, cobaltFilename) || mediaPath.split(".").pop() || "mp4";
     const thumbPath = join(dir, "thumb.jpg");
-    const hasThumb = await makeThumbnail(mediaPath, thumbPath, 1);
+    // A still image has no timeline to seek: ffmpeg -ss 1 exits 0 but
+    // writes no frame, so makeThumbnail always fails on photos — the
+    // file check then nulls the thumb, and grid + viewer both break
+    // (the viewer loads the thumb endpoint too). For a still, the
+    // photo itself IS the thumbnail — same as the /upload path and
+    // the same as photo siblings (thumb_key = r2_key).
+    const isStill = (contentType ?? "").startsWith("image/");
+    const hasThumb = isStill
+      ? await normalizeImageToJpeg(mediaPath, thumbPath)
+      : await makeThumbnail(mediaPath, thumbPath, 1);
     const r2Key = `users/me/items/${itemId}/original.${ext}`;
     const thumbKey = hasThumb ? `users/me/items/${itemId}/thumb.jpg` : null;
     const spritePath = join(dir, "sprite.jpg");
@@ -814,7 +823,6 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
     // writes nothing). Matches the /upload path, which skips sprites
     // for stills. A slideshow video has contentType video/mp4, so it
     // still gets a sprite.
-    const isStill = (contentType ?? "").startsWith("image/");
     const sprite = isStill
       ? { ok: false, count: 0 }
       : await makeSprite(
