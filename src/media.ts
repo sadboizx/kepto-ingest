@@ -325,7 +325,21 @@ export function makeSprite(
       spritePath,
     ]);
     p.on("error", () => resolve({ ok: false, count: 0 }));
-    p.on("close", (code) => resolve({ ok: code === 0, count: code === 0 ? count : 0 }));
+    // Same trap as makeThumbnail: ffmpeg can exit 0 without writing
+    // the tile (e.g. a still image — the fps filter yields 1 frame,
+    // the tile never fills). Trust the file on disk, not the exit code
+    // (2026-11-17: two photo posts logged sprite_ok:true with no
+    // sprite.jpg on disk).
+    p.on("close", async (code) => {
+      if (code !== 0) return resolve({ ok: false, count: 0 });
+      try {
+        const { stat } = await import("node:fs/promises");
+        const ok = (await stat(spritePath)).size > 0;
+        resolve({ ok, count: ok ? count : 0 });
+      } catch {
+        resolve({ ok: false, count: 0 });
+      }
+    });
   });
 }
 

@@ -11,7 +11,10 @@
  * be a JSON boolean — a string "true" is rejected (the old Shortcuts
  * bug).
  *   status "tunnel" | "redirect" -> body.url is the direct file URL.
- *   status "picker"              -> body.picker[]; take the first video item.
+ *   status "picker"              -> body.picker[]; a video item if there
+ *     is one, else ALL photo items, so a TikTok photo post saves every
+ *     photo (as separate photo items) instead of just its first photo.
+ *     Photos only — no slideshow video, no background music.
  * Anything else is an error (e.g. error.api.content.post.age = age-restricted
  * post, which Cobalt cannot fetch anonymously — retrying will not help).
  */
@@ -19,6 +22,8 @@
 export interface CobaltResult {
   url: string;
   filename?: string;
+  /** TikTok photo post: every photo in the picker, in post order. */
+  photos?: string[];
 }
 
 interface CobaltPickerItem {
@@ -75,10 +80,23 @@ export async function resolveWithCobalt(
     return { url: data.url, filename: data.filename };
   }
   if (data.status === "picker" && Array.isArray(data.picker)) {
-    const video =
-      data.picker.find((p) => p.type === "video" && p.url) ??
-      data.picker.find((p) => p.url);
+    const video = data.picker.find((p) => p.type === "video" && p.url);
     if (video?.url) return { url: video.url, filename: data.filename };
+    // Photo picker (TikTok photo post): return every photo. The caller
+    // saves each as its own photo item. Returning only the first photo
+    // would silently drop the rest of the post.
+    const photos = data.picker
+      .filter((p) => p.type === "photo" && p.url)
+      .map((p) => p.url as string);
+    if (photos.length) {
+      return {
+        url: photos[0],
+        filename: data.filename,
+        photos,
+      };
+    }
+    const first = data.picker.find((p) => p.url);
+    if (first?.url) return { url: first.url, filename: data.filename };
     throw new Error("cobalt_picker_empty");
   }
   const code = data.error?.code ?? data.status ?? "unknown";

@@ -87,6 +87,7 @@ async function resolveWithCobaltChain(
   }
   throw lastError;
 }
+
 const YTDLP_BIN = process.env.YTDLP_BIN ?? "yt-dlp";
 const MAX_CONCURRENT = 2;
 
@@ -534,15 +535,103 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
     let fileSize = 0;
     let sha256 = "";
     let cobaltFilename: string | undefined;
+    // TikTok photo post: photos 1..n become sibling items, created by
+    // the Worker from the `photos` field of the callback below. Photo 0
+    // is the main item (mediaPath, uploaded downstream as original.*).
+    let cobaltPhotos: Array<{
+      r2_key: string;
+      thumb_key: string;
+      content_type: string;
+      width: number | null;
+      height: number | null;
+      file_size: number;
+      sha256: string;
+    }> = [];
     try {
       const resolved = await resolveWithCobaltChain(pageUrl, itemId);
       cobaltFilename = resolved.filename;
-      const ext = extFor(null, resolved.filename);
-      const dl = await downloadToFile(resolved.url, join(dir, `media.${ext}`));
-      mediaPath = dl.path;
-      contentType = dl.contentType;
-      fileSize = dl.fileSize;
-      sha256 = dl.sha256;
+      if (resolved.photos && resolved.photos.length) {
+        // TikTok photo post: save EVERY photo as a photo item — no
+        // slideshow video, no audio. Each surviving photo is
+        // normalized to a real JPEG and uploaded to R2 as
+        // photo-<i>.jpg (i = position among survivors, picker order).
+        // Photo 0 is the main item; photos 1..n are siblings for the
+        // Worker (cobaltPhotos, sent in the callback below).
+        const uploaded: Array<{
+          path: string;
+          r2Key: string;
+          width: number | null;
+          height: number | null;
+          fileSize: number;
+          sha256: string;
+        }> = [];
+        for (let i = 0; i < resolved.photos.length; i++) {
+          try {
+            const raw = await downloadToFile(resolved.photos[i], join(dir, `photo${i}.jpg`));
+            const normPath = join(dir, `photo${i}.norm.jpg`);
+            if (!(await normalizeImageToJpeg(raw.path, normPath))) continue;
+            const pMeta = await probe(normPath);
+            const st = await stat(normPath);
+            const hash = await new Promise<string>((resolve, reject) => {
+              const h = createHash("sha256");
+              const s = createReadStream(normPath);
+              s.on("data", (c: Buffer | string) => h.update(c));
+              s.on("end", () => resolve(h.digest("hex")));
+              s.on("error", reject);
+            });
+            const r2Key = `users/me/items/${itemId}/photo-${uploaded.length}.jpg`;
+            // First survivor is the main item: it goes up downstream
+            // as original.jpg — uploading it here too would leave an
+            // orphaned photo-0.jpg in R2. Siblings upload here.
+            if (uploaded.length > 0) {
+              await uploadFile(r2, R2_BUCKET, r2Key, normPath, "image/jpeg");
+            }
+            uploaded.push({
+              path: normPath,
+              r2Key,
+              width: pMeta.width ?? null,
+              height: pMeta.height ?? null,
+              fileSize: st.size,
+              sha256: hash,
+            });
+          } catch {
+            // One photo failing must not kill the rest.
+          }
+        }
+        if (uploaded.length) {
+          const first = uploaded[0];
+          mediaPath = first.path;
+          contentType = "image/jpeg";
+          fileSize = first.fileSize;
+          sha256 = first.sha256;
+          cobaltPhotos = uploaded.slice(1).map((p) => ({
+            r2_key: p.r2Key,
+            thumb_key: p.r2Key,
+            content_type: "image/jpeg",
+            width: p.width,
+            height: p.height,
+            file_size: p.fileSize,
+            sha256: p.sha256,
+          }));
+          console.log(
+            JSON.stringify({ event: "cobalt_photos", item_id: itemId, photos: uploaded.length }),
+          );
+        } else {
+          // No photo survived: fall back to the old single-file download.
+          const dl = await downloadToFile(resolved.url, join(dir, `media.${extFor(null, resolved.filename)}`));
+          mediaPath = dl.path;
+          contentType = dl.contentType;
+          fileSize = dl.fileSize;
+          sha256 = dl.sha256;
+        }
+      } else {
+        const ext = extFor(null, resolved.filename);
+        const dl = await downloadToFile(resolved.url, join(dir, `media.${ext}`));
+        mediaPath = dl.path;
+        contentType = dl.contentType;
+        fileSize = dl.fileSize;
+        sha256 = dl.sha256;
+      }
     } catch (cobaltErr) {
       // The chain already logged each cobalt_failed (per instance).
       const cobaltMsg = String(cobaltErr);
@@ -720,14 +809,22 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
         ? Math.min(Math.ceil(meta.duration / spriteInterval), SPRITE_MAX_FRAMES)
         : SPRITE_MAX_FRAMES;
     const spriteRows = Math.ceil(spriteCount / SPRITE_COLS);
-    const sprite = await makeSprite(
-      mediaPath,
-      spritePath,
-      meta.duration ?? null,
-      spriteInterval,
-      SPRITE_COLS,
-      spriteRows,
-    );
+    // No sprite for a still image: there is nothing to scrub, and the
+    // tile filter never fills from a single frame (it exits 0 and
+    // writes nothing). Matches the /upload path, which skips sprites
+    // for stills. A slideshow video has contentType video/mp4, so it
+    // still gets a sprite.
+    const isStill = (contentType ?? "").startsWith("image/");
+    const sprite = isStill
+      ? { ok: false, count: 0 }
+      : await makeSprite(
+          mediaPath,
+          spritePath,
+          meta.duration ?? null,
+          spriteInterval,
+          SPRITE_COLS,
+          spriteRows,
+        );
     const previewKey = sprite.ok ? `users/me/items/${itemId}/sprite.jpg` : null;
 
     // 3. Upload straight to R2, then tell the Worker the item is ready.
@@ -777,6 +874,9 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
       preview_rows: previewKeyOut ? spriteRows : null,
       preview_interval: previewKeyOut ? spriteInterval : null,
       preview_count: previewKeyOut ? sprite.count : null,
+      // TikTok photo post: photos 1..n — the Worker creates one sibling
+      // item per entry. Omitted when there are no siblings.
+      ...(cobaltPhotos.length ? { photos: cobaltPhotos } : {}),
     });
   } catch (e) {
     const message = String(e instanceof Error ? e.message : e).slice(0, 500);
