@@ -732,18 +732,35 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
 
     // 3. Upload straight to R2, then tell the Worker the item is ready.
     await uploadFile(r2, R2_BUCKET, r2Key, mediaPath, contentType ?? "video/mp4");
+    // Thumb/sprite uploads are non-fatal: the original is already in
+    // R2 and the item is viewable without them. A failed thumb upload
+    // used to throw here, failing the whole job (and on 2026-11-17 the
+    // missing thumb.jpg crashed the entire ingest process). Null the
+    // key on failure so the Worker never points at a missing R2 object.
+    let thumbKeyOut: string | null = thumbKey;
     if (hasThumb && thumbKey) {
-      await uploadFile(r2, R2_BUCKET, thumbKey, thumbPath, "image/jpeg");
+      try {
+        await uploadFile(r2, R2_BUCKET, thumbKey, thumbPath, "image/jpeg");
+      } catch (e) {
+        console.error(JSON.stringify({ event: "thumb_upload_failed", item_id: itemId, error: String(e).slice(0, 200) }));
+        thumbKeyOut = null;
+      }
     }
+    let previewKeyOut: string | null = previewKey;
     if (sprite.ok && previewKey) {
-      await uploadFile(r2, R2_BUCKET, previewKey, spritePath, "image/jpeg");
+      try {
+        await uploadFile(r2, R2_BUCKET, previewKey, spritePath, "image/jpeg");
+      } catch (e) {
+        console.error(JSON.stringify({ event: "sprite_upload_failed", item_id: itemId, error: String(e).slice(0, 200) }));
+        previewKeyOut = null;
+      }
     }
     console.log(JSON.stringify({ event: "ingest_ready", item_id: itemId, r2_key: r2Key, file_size: fileSize, has_audio: meta.hasAudio ?? null, sprite_ok: sprite.ok, sprite_frames: sprite.count }));
     await callback({
       item_id: itemId,
       r2_key: r2Key,
-      thumb_key: thumbKey,
-      preview_key: previewKey,
+      thumb_key: thumbKeyOut,
+      preview_key: previewKeyOut,
       content_type: contentType ?? "video/mp4",
       title: gathered.title ?? null,
       caption: gathered.caption ?? null,
@@ -756,10 +773,10 @@ async function runJob(itemId: string, pageUrl: string): Promise<void> {
       height: meta.height ?? null,
       file_size: fileSize,
       sha256,
-      preview_cols: sprite.ok ? SPRITE_COLS : null,
-      preview_rows: sprite.ok ? spriteRows : null,
-      preview_interval: sprite.ok ? spriteInterval : null,
-      preview_count: sprite.ok ? sprite.count : null,
+      preview_cols: previewKeyOut ? SPRITE_COLS : null,
+      preview_rows: previewKeyOut ? spriteRows : null,
+      preview_interval: previewKeyOut ? spriteInterval : null,
+      preview_count: previewKeyOut ? sprite.count : null,
     });
   } catch (e) {
     const message = String(e instanceof Error ? e.message : e).slice(0, 500);

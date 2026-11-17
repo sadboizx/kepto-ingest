@@ -114,7 +114,20 @@ export function makeThumbnail(
       thumbPath,
     ]);
     p.on("error", () => resolve(false));
-    p.on("close", (code) => resolve(code === 0));
+    // ffmpeg can exit 0 without writing a frame (e.g. a clip shorter
+    // than the seek point): trust the file on disk, not the exit code.
+    // A caller that trusts exit code 0 alone later feeds a missing
+    // thumb.jpg to the R2 uploader and crashes the process
+    // (2026-11-17: ENOENT on /tmp/kepto-*/thumb.jpg).
+    p.on("close", async (code) => {
+      if (code !== 0) return resolve(false);
+      try {
+        const { stat } = await import("node:fs/promises");
+        resolve((await stat(thumbPath)).size > 0);
+      } catch {
+        resolve(false);
+      }
+    });
   });
 }
 
